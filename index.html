@@ -538,7 +538,7 @@ let AC=null,SFXB=null;
 function initAudio(){try{if(navigator.audioSession&&navigator.audioSession.type!=='ambient')navigator.audioSession.type='ambient';}catch(e){}
   if(!AC){const C=window.AudioContext||window.webkitAudioContext;if(!C)return;AC=new C();SFXB=AC.createGain();SFXB.gain.value=.9;SFXB.connect(AC.destination);}
   try{if(AC.state!=='running')AC.resume();}catch(e){}}
-for(const ev of ['touchend','pointerup','keydown'])document.addEventListener(ev,()=>{try{if(AC&&AC.state!=='running')AC.resume();}catch(e){}},{capture:true,passive:true});
+for(const ev of ['touchend','pointerup','keydown'])document.addEventListener(ev,()=>{try{if(AC&&AC.state!=='running')AC.resume();}catch(e){}try{musicKick();}catch(e){}},{capture:true,passive:true});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){try{if(AC&&AC.state!=='running')AC.resume();}catch(e){}}});
 const mf=m=>440*Math.pow(2,(m-69)/12);
 function bell(f,t,dur,vol){if(!AC||G.muted)return;for(const [m,a] of [[1,1],[2,0.45],[3.01,0.22],[4.17,0.12],[5.43,0.06]]){const o=AC.createOscillator();o.frequency.value=f*m;const g=AC.createGain();g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(vol*a,t+0.012);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);o.connect(g).connect(SFXB);o.start(t);o.stop(t+dur+0.05);}}
@@ -593,28 +593,53 @@ function mesh(g,m,cast=false,recv=true,parent=scene){const o=new THREE.Mesh(g,m)
 function cyl(mg,a,b,r,seg=6,col){const d=new THREE.Vector3().subVectors(b,a),len=d.length();const q=new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),d.normalize());mg.addM(new THREE.CylinderGeometry(r,r,len,seg),new THREE.Matrix4().compose(a.clone().add(b).multiplyScalar(0.5),q,new THREE.Vector3(1,1,1)),col);}
 function std(o){return new THREE.MeshStandardMaterial(o);}
 
-/* ---------- 背景音樂：輕鬆愉快（即時合成：馬林巴琴旋律＋烏克麗麗和弦＋低音＋沙錘） ---------- */
-// 玩家撳「傾偈」（傾偈／答題期間）音樂淡出，返去行走先淡入返。
-const MUS={g:null,next:0,step:0,timer:0,vol:0,noise:null};
+/* ---------- 背景音樂：輕鬆愉快（馬林巴琴旋律＋烏克麗麗和弦＋低音＋沙錘） ---------- */
+// 用 OfflineAudioContext 預先渲染成 WAV，再用 <audio> 循環播放：
+// iPad 嘅 Web Audio 會被靜音掣擋住，但 <audio> 唔會（媒體播放）。渲染唔到先退回即時合成。
+// 玩家撳「傾偈」（傾偈／答題期間）音樂停；返去行走先再播。
+const MUS={g:null,next:0,step:0,timer:0,vol:0,noise:null,el:null,url:null,building:false,fail:false,playing:false,fadeT:0};
 const MEL=[ // 8 小節 × 8 個八分音符（-1＝休止），C 大調五聲音階
  76,-1,79,76,-1,74,72,-1,  72,-1,76,74,72,-1,69,-1,  69,72,-1,76,-1,74,72,-1,  74,-1,79,-1,76,74,-1,-1,
  79,-1,81,79,-1,76,-1,72,  76,-1,81,-1,79,76,-1,-1,  81,-1,79,76,-1,74,72,-1,  74,76,74,-1,72,-1,67,-1];
-const CHORDS=[[60,64,67],[57,60,64],[53,57,60],[55,59,62]],BASS=[48,45,53,55];
+const CHORDS=[[60,64,67],[57,60,64],[53,57,60],[55,59,62]],BASS=[48,45,53,55],MSP=0.3125;
+// 排一個八分音符：ctx＝音訊環境，dst＝輸出，nz＝噪音緩衝
+function mNote(ctx,dst,nz,s,t){const bar=(s>>3)&7,e=s&7,ch=CHORDS[bar&3];
+  const tone=(f,tt,vol,type,dec)=>{const o=ctx.createOscillator();o.type=type;o.frequency.value=f;const g=ctx.createGain();g.gain.setValueAtTime(0.0001,tt);g.gain.exponentialRampToValueAtTime(vol,tt+0.008);g.gain.exponentialRampToValueAtTime(0.0001,tt+dec);o.connect(g).connect(dst);o.start(tt);o.stop(tt+dec+0.05);};
+  const m=MEL[s];if(m>=0){tone(mf(m),t,.2,'triangle',.5);tone(mf(m+12),t,.05,'sine',.28);}
+  if(e===0||e===4)tone(mf(BASS[bar&3]),t,.24,'sine',.6);
+  if(e%2===1)ch.forEach((c,i)=>tone(mf(c),t+i*.012,.06,'triangle',.24));
+  if(e%2===0&&e!==0){const ns=ctx.createBufferSource();ns.buffer=nz;const f=ctx.createBiquadFilter();f.type='highpass';f.frequency.value=6000;const g=ctx.createGain();g.gain.setValueAtTime(.06,t);g.gain.exponentialRampToValueAtTime(.001,t+.05);ns.connect(f).connect(g).connect(dst);ns.start(t);ns.stop(t+.08);}}
+function wavBlob(buf){const n=buf.length,ch=buf.getChannelData(0),out=new DataView(new ArrayBuffer(44+n*2));const W=(o,t)=>{for(let i=0;i<t.length;i++)out.setUint8(o+i,t.charCodeAt(i));};
+  W(0,'RIFF');out.setUint32(4,36+n*2,true);W(8,'WAVE');W(12,'fmt ');out.setUint32(16,16,true);out.setUint16(20,1,true);out.setUint16(22,1,true);out.setUint32(24,buf.sampleRate,true);out.setUint32(28,buf.sampleRate*2,true);out.setUint16(32,2,true);out.setUint16(34,16,true);W(36,'data');out.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++){const v=Math.max(-1,Math.min(1,ch[i]));out.setInt16(44+i*2,v<0?v*0x8000:v*0x7fff,true);}return new Blob([out],{type:'audio/wav'});}
+const SILENT='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+// 喺撳掣（用戶手勢）嗰下建立並解鎖 <audio>，iPad 先准之後自動播放
+function musicPrime(){if(MUS.el)return;const a=new Audio();a.src=SILENT;a.loop=true;a.volume=.4;a.setAttribute('playsinline','');MUS.el=a;MUS.primed=true;try{const p=a.play();if(p&&p.catch)p.catch(()=>{});}catch(e){}}
+function musicKick(){const a=MUS.el;if(!a||!MUS.url||MUS.fail)return;if(!G.muted&&(G.mode==='play'||G.mode==='win')&&a.paused){MUS.playing=true;try{const p=a.play();if(p&&p.catch)p.catch(()=>{MUS.playing=false;});}catch(e){}}}
+async function musicBuild(){if(MUS.building||MUS.url||MUS.fail)return;MUS.building=true;
+  try{const OC=window.OfflineAudioContext||window.webkitOfflineAudioContext,sr=22050,dur=64*MSP+1.2;const ctx=new OC(1,Math.ceil(sr*dur),sr);
+    const nb=ctx.createBuffer(1,sr,sr),d=nb.getChannelData(0);for(let i=0;i<sr;i++)d[i]=Math.random()*2-1;
+    const mst=ctx.createGain();mst.gain.value=.8;mst.connect(ctx.destination);for(let s=0;s<64;s++)mNote(ctx,mst,nb,s,s*MSP+.05);
+    const r=await new Promise((res,rej)=>{const p=ctx.startRendering();if(p&&p.then)p.then(res,rej);else ctx.oncomplete=e=>res(e.renderedBuffer);});
+    // 剪成剛好 64 步長度，令循環銜接
+    const len=Math.round(64*MSP*sr),cut=ctx.createBuffer(1,len,sr),src=r.getChannelData(0),dst=cut.getChannelData(0);for(let i=0;i<len;i++)dst[i]=src[i]+(i<Math.round(1.1*sr)?src[len+i]||0:0);
+    MUS.url=URL.createObjectURL(wavBlob(cut));const a=MUS.el||new Audio();a.loop=true;a.volume=.4;a.setAttribute('playsinline','');a.src=MUS.url;MUS.el=a;MUS.playing=false;}
+  catch(e){console.warn('音樂渲染失敗，改用即時合成',e);MUS.fail=true;}
+  MUS.building=false;}
+// 即時合成（後備）
 function musicInit(){if(!AC||MUS.g)return;MUS.g=AC.createGain();MUS.g.gain.value=0;MUS.g.connect(AC.destination);
   const n=AC.sampleRate,b=AC.createBuffer(1,n,AC.sampleRate),d=b.getChannelData(0);for(let i=0;i<n;i++)d[i]=Math.random()*2-1;MUS.noise=b;
   MUS.next=AC.currentTime+0.1;MUS.step=0;MUS.timer=setInterval(musicSched,120);}
-function mTone(f,t,dur,vol,type,dec){const o=AC.createOscillator();o.type=type;o.frequency.value=f;const g=AC.createGain();g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+0.008);g.gain.exponentialRampToValueAtTime(0.0001,t+(dec||dur));o.connect(g).connect(MUS.g);o.start(t);o.stop(t+(dec||dur)+0.05);}
 function musicSched(){if(!AC||!MUS.g||AC.state!=='running'){if(AC&&MUS.g)MUS.next=Math.max(MUS.next,AC.currentTime);return;}
-  const SP=0.3125;  // 八分音符＝0.3125 秒（約 96 拍／分鐘）
-  while(MUS.next<AC.currentTime+0.6){const s=MUS.step%64,bar=s>>3,e=s&7,t=MUS.next,ch=CHORDS[bar&3];
-    const m=MEL[s];if(m>=0){mTone(mf(m),t,.5,.17,'triangle',.45);mTone(mf(m+12),t,.3,.04,'sine',.25);}
-    if(e===0||e===4)mTone(mf(BASS[bar&3]),t,.5,.2,'sine',.55);
-    if(e%2===1){ch.forEach((c,i)=>mTone(mf(c),t+i*.012,.25,.05,'triangle',.22));}
-    if(e%2===0&&e!==0){const ns=AC.createBufferSource();ns.buffer=MUS.noise;const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=6000;const g=AC.createGain();g.gain.setValueAtTime(.05,t);g.gain.exponentialRampToValueAtTime(.001,t+.05);ns.connect(f).connect(g).connect(MUS.g);ns.start(t);ns.stop(t+.08);}
-    MUS.next+=SP;MUS.step++;}}
-// 每格呼叫：按狀態淡入淡出（只喺行走／結尾畫面有音樂，傾偈答題時冇）
-function musicTick(){if(!AC)return;if(!MUS.g)musicInit();if(!MUS.g)return;
-  const want=!G.muted&&(G.mode==='play'||G.mode==='win')&&G.state==='play'?0.34:0;if(want!==MUS.vol){MUS.vol=want;MUS.g.gain.setTargetAtTime(want,AC.currentTime,want?0.9:0.18);}}
+  while(MUS.next<AC.currentTime+0.6){mNote(AC,MUS.g,MUS.noise,MUS.step%64,MUS.next);MUS.next+=MSP;MUS.step++;}}
+function musicTick(){if(G.state!=='play')return;
+  const want=!G.muted&&(G.mode==='play'||G.mode==='win');
+  if(!MUS.url&&!MUS.fail){musicBuild();}
+  if(MUS.el&&(MUS.url||MUS.primed)&&!MUS.fail){const a=MUS.el;if(!MUS.url)return;
+    if(want&&!MUS.playing&&MUS.url){MUS.playing=true;clearTimeout(MUS.fadeT);a.volume=.4;const p=a.play();if(p&&p.catch)p.catch(()=>{MUS.playing=false;});}
+    else if(!want&&MUS.playing){MUS.playing=false;let v=a.volume;const step=()=>{v-=.08;if(MUS.playing)return;if(v<=0.02){a.pause();a.volume=.4;}else{try{a.volume=v;}catch(e){}MUS.fadeT=setTimeout(step,60);}};step();}
+    return;}
+  if(MUS.fail&&AC){if(!MUS.g)musicInit();if(!MUS.g)return;const w=want?0.34:0;if(w!==MUS.vol){MUS.vol=w;MUS.g.gain.setTargetAtTime(w,AC.currentTime,w?0.9:0.18);}}}
 
 /* ======================= 旅遊星球：島嶼地圖 ======================= */
 // 地圖材料來自「真．旅遊星球」（THS/game/index.html 嘅 LAYOUTS 圓形島）：
@@ -2523,13 +2548,13 @@ $('#bMute').onclick=()=>{G.muted=!G.muted;SV.muted=G.muted;saveSV();$('#bMute').
 $('#bMute').innerHTML=IC(G.muted?'mute':'sound');
 $('#winOk').onclick=()=>{$('#win').classList.add('hidden');G.mode='play';};
 $('#bHome').onclick=()=>{if(G.mode==='play'){walkTo={x:0,z:9};}};
-$('#startBtn').onclick=()=>{initAudio();popSfx();$('#cover').classList.add('hidden');$('#resetBtn').classList.add('hidden');G.mode='play';G.state='play';hippoSfx();say('你好呀！我係河馬。我哋一齊去河馬星球探險，同朋友玩問答啦！','zh-HK');if(SV.en<=0)hint('河馬冇能量喇！去池塘飲水先啦！');setTimeout(()=>{try{icoWarm();}catch(e){}},50);};
+$('#startBtn').onclick=()=>{initAudio();try{musicPrime();musicBuild();}catch(e){}popSfx();$('#cover').classList.add('hidden');$('#resetBtn').classList.add('hidden');G.mode='play';G.state='play';hippoSfx();say('你好呀！我係河馬。我哋一齊去河馬星球探險，同朋友玩問答啦！','zh-HK');if(SV.en<=0)hint('河馬冇能量喇！去池塘飲水先啦！');setTimeout(()=>{try{icoWarm();}catch(e){}},50);};
 $('#resetBtn').onclick=()=>{if(confirm('清除所有星星同進度？')){SV={stars:0,correct:0,done:{},muted:SV.muted,en:5};saveSV();location.reload();}};
 updStars();updDone();updEn();
 // 預先畫第一批圖示，避免第一題卡頓
 setTimeout(()=>{try{icoWarm();}catch(e){}},400);
 for(const n of NPCI)n.root.rotation.y=Math.atan2(-n.pos.x,-n.pos.z);
-window.__dbg={HP,G,NPCI,startTalk,SV,camera,scene,ico,IB,makeQ,QT,PONDS,hint,updEn,INTS,SENS,enterRoom,exitRoom,get where(){return WHERE;}};
+window.__dbg={HP,G,NPCI,startTalk,SV,camera,scene,ico,IB,makeQ,QT,PONDS,hint,updEn,MUS,INTS,SENS,enterRoom,exitRoom,get where(){return WHERE;}};
 loop();
 
 </script>
